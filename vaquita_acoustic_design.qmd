@@ -1,0 +1,312 @@
+---
+title: "Vaquita acoustic survey 2024 - proposed survey design v3"
+format: 
+  pdf:
+    fig-height: 5
+editor: source
+author: Len Thomas + Vaquita Expert Panel
+date: now
+echo: false
+cache: true
+---
+
+```{r}
+#Load packages and define constants
+#suppressPackageStartupMessages is to quiet chatty package startups
+library(ggplot2)
+theme_set(theme_bw())
+suppressPackageStartupMessages(library(ggpubr))
+
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(terra))
+suppressPackageStartupMessages(library(tidyterra))
+library(rnaturalearth) #Rough coastline
+
+library(MBHdesign)
+library(readxl)
+
+#EPSG code for UTM11N
+UTM11N <- "epsg:32611"
+WGS1984 <-"epsg:4326"
+```
+
+## History
+
+- v1 12th July 2024. Initial balanced acceptance sampling design on a 1x1km grid, with 30 locations per deployment.
+- v2 17th July 2024. Switched to a 200m grid on suggestion from Barb Taylor.
+- v3 14th August 2024.  Final version for deployment - went to 35 locations per deployment.
+
+## Introduction
+
+This design arises from a planning meeting held on 2nd July 2024, and subsequent discussions.  The objective of the passive acoustic monitoring (PAM) survey is to determine whether vaquita may be present outside the area of intensive visual surveying in 2024, and also outside of the zero tolerance area (ZTA) which will be subject to a separate acoustic survey.
+
+For design purposes, we assume there are 35 acoustic sensors available and that they will be redeployed at least once.  In reality there may be more than 35 sensors available and they may be redeployed up to 4 times - however the sampling locations of the 3rd and 4th deployment will certainly be dependent on the findings of the earlier deployments (and adaptive sampling design).  It may be that the location of the 2nd deployment is also dependent on the 1st, but for the purposes of this document we will produce a set of 70 sample locations that can be used to make two deployments of 35 sample locations.
+
+In selecting locations, we use the following guidance:
+- sampling locations should be outside the ZTA but within the vaquita refuge area;
+- sampling locations should be very close to places where vaquita have previously been seen (during sightings surveys that took place in 1993, 1997, 2008 and 2015) or heard (during acoustic surveys that took place in 2011-2018) ;
+- sampling locations for each deployment should be distributed as evenly as possible over the area of interest
+- locations should be chosen objectively using some element of randomization
+
+After a second round of consultation, we decided to place sample locations at randomly selected sites on a 200m grid covering the refuge area, with probability of selecting a grid cell being a function of previous visual and acoustic detections and using a spatially balanced design algorithm.  The grid spacing is a compromize between wanting to have sample locations close to previous detections (because we suspect habitat preference of vaquita varies strongly over small spatial scales) vs wanting to have sensors far enough apart that they are not redundant.  The computer code (in R) that produced this design is fully automated and other spacings could readily be used if desired.
+
+## Sightings
+
+```{r}
+#Read in the sightings files
+filenames <- paste0("sightings ", c(1993, 1997, 2008, 2015), ".csv")
+sight_dat <- read.csv(filenames[1])
+for(i in 2:length(filenames)){
+  sight_dat <- rbind(sight_dat, read.csv(filenames[i]))
+}
+#First sighting in 1993 is an outlier, so remove it
+ind <- sight_dat$Sight.lon < -114
+sight_dat <- sight_dat[ind, ]
+
+#Convert to sf object
+sight_dat <- st_as_sf(sight_dat, coords = c("Sight.lon","Sight.lat"), 
+                      crs = WGS1984, remove = FALSE)
+#Transform to UTM11N
+sight_dat_utm <- st_transform(sight_dat, crs = UTM11N)
+
+#Extract bounding box and round to nearest km
+sight_bbox <- st_bbox(sight_dat_utm)
+sight_bbox["xmin"] <- floor(sight_bbox["xmin"]/1000) * 1000
+sight_bbox["ymin"] <- floor(sight_bbox["ymin"]/1000) * 1000
+sight_bbox["xmax"] <- ceiling(sight_bbox["xmax"]/1000) * 1000
+sight_bbox["ymax"] <- ceiling(sight_bbox["ymax"]/1000) * 1000
+
+#Read in refuge and zta
+filename <- "Vaquita areas and ZTA acoustic sampling sites.xlsx"
+refuge <- read_xlsx(filename, sheet = 1) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = WGS1984) %>%
+  summarise((geometry = st_combine(geometry))) %>% 
+  st_cast("POLYGON")
+zta <- read_xlsx(filename, sheet = 3) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = WGS1984) %>%
+  summarise((geometry = st_combine(geometry))) %>% 
+  st_cast("POLYGON")
+
+#Create a SpatRaster object, with a 200m mesh
+gr <- rast(extent = ext(sight_bbox), resolution = 200, crs = UTM11N)
+n <- ncell(gr)
+
+#Get a vector showing whether each sighting is in the zta or not
+sighting_in_zta <- st_intersects(zta, sight_dat, sparse = FALSE)[1, ]
+#Get a vector showing whether each sighting is in the refuge or not
+sighting_in_refuge <- st_intersects(refuge, sight_dat, sparse = FALSE)[1, ]
+#Sample locations are only those inside refuge but outside zta
+potential_sample <- sighting_in_refuge & !sighting_in_zta
+
+#Make a vector of inclusion probabilities
+sighting_counts <- rep(0, n)
+#Done as a loop as cellFromXY returns only one ID number even if there is
+# more than one point in it, so better to do one at a time
+for(i in 1:nrow(sight_dat_utm)){
+  if(potential_sample[i]){
+    cell_with_sighting <- cellFromXY(gr, st_coordinates(sight_dat_utm[i, ]))
+    sighting_counts[cell_with_sighting] <- sighting_counts[cell_with_sighting] + 1
+  }
+}
+#I found that, despite removing sightings from inside the ZTA, I was
+# still getting rasters with centroids in the ZTA with a non-zero p
+# I think this is becasue some sightings were made outside the ZTA at the 
+# far corners of rasters that have centroids in the ZTA
+#Hence I added some code here to set the sighting_count of any raster
+# within the ZTA to 0
+cells_in_zta <- cells(gr, vect(st_transform(zta, crs = UTM11N)))[, "cell"]
+sighting_counts[cells_in_zta] <- 0
+
+#standardize the sighting_count-based inclusion prob so it has a max of 1
+p_sighting <- sighting_counts / max(sighting_counts)
+```
+
+We read in the locations of all sightings from the 1993, 1997, 2008 and 2015 surveys and created a 1x1 km raster covering these.  (One exception was that we removed the first sighting from 1993 since it was very far away from the refuge and from any subsequent sighting.)  We calculated the number of sightings in each grid cell -- this ranged from 0 to 5.  We set counts for any rasters inside the ZTA or outside the refuge to 0, because this survey will not cover those areas.  A map showing the sighting locations and the raster grid cell counts is given in @fig-sightings.
+
+```{r}
+#| label: fig-sightings
+#| fig-cap: "Sighting locations (crosses) and counts of number of sightings per raster grid square (colors)  Note that only sightings within the vaquita refuge but outside the ZTA contributed to the counts."
+
+values(gr) <- sighting_counts
+#Create a map showing sighting locations
+tmp_bbox <- st_bbox(sight_dat)
+mexico <- ne_countries(country = "Mexico", scale = "small")
+ggplot(data = mexico) +  xlab("longitude") + ylab("latitude") +
+  geom_spatraster(data = gr) +
+  scale_fill_gradient(low = "white", high = "blue", na.value = NA) +
+  geom_sf() + 
+  geom_sf(data = refuge, fill = NA) +
+  geom_sf(data = zta, fill = NA, col = "red") +
+  geom_sf(data = sight_dat, shape = "x", size = 1, colour = "black") + 
+  coord_sf(crs = st_crs(UTM11N), xlim = c(sight_bbox[c(1, 3)]) + c(-1E4, 1E4), 
+           ylim = c(sight_bbox[c(2, 4)] + c(-0E3, 2E3)))
+```
+
+## Acoustic detections
+
+```{r}
+filename2 <- "acoustic data.xlsx"
+acoustic_sites <- read_xlsx(filename2, sheet = "sites") %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = WGS1984, remove = FALSE)
+#Transform to UTM11N
+acoustic_sites_utm <- st_transform(acoustic_sites, crs = UTM11N)
+#Get a vector of raster cells that have acoustic sensors in them
+cell_with_acoustics <- cellFromXY(gr, st_coordinates(acoustic_sites_utm))
+#Get a vector showing whether each acoustic site is in the zta or not
+acoustic_in_zta <- st_intersects(zta, acoustic_sites, sparse = FALSE)[1, ]
+#Get a vector showing whether each acoustic site is in the refuge or not
+#They should all be in - but it turns out one is outside
+# I think it's only just outside so I'll include for now
+acoustic_in_refuge <- st_intersects(refuge, acoustic_sites, sparse = FALSE)[1, ]
+#Sample locations are only those inside refuge but outside zta
+potential_acoustic_sample <- !acoustic_in_zta
+
+acoustic_clicks <- read_xlsx(filename2, sheet = "clicks_trunc")   
+acoustic_effort <- read_xlsx(filename2, sheet = "effortDays_trunc")
+# There are lots of ways potential ways to get inclusion probs
+# Here I elect to sum clicks and effort across years and work out 
+# from this the mean clicks per unit effort - this heavily weights
+# the older data when there were more clicks
+acoustic_clicks_per_effort <- rowSums(as.matrix(acoustic_clicks)) /
+  rowSums(as.matrix(acoustic_effort))
+log_acoustic_clicks_per_effort <- log(acoustic_clicks_per_effort + 1)
+```
+
+The number of acoustic detections declined greatly during the years of the PAM surveys, and also largely contracted into the area now covered by the ZTA (see Figure 4 of Jaramillo-Legorreta et al. 2019 and note the values there are on a logarithmic scale).  Our interest here is in determining whether vaquita are once again occurring outside the ZTA, so we base sampling probabilities for the new design on the sum of detections accross all years of the acoustic survey.  Specifically, we calculated acoustic encounter rate for each sample location as the total number of clicks detected at that location across all years of monitoring divided by the total number of days of monitoring.  We refer to this metric as clicks per day, and the values are shown on @fig-acoustics.   
+
+```{r}
+#| label: fig-acoustics
+#| fig-cap: "Acoustic click detections per day at the PAM sampling locations."
+
+#Create a map showing sighting locations
+ggplot(data = mexico) +  xlab("longitude") + ylab("latitude") +
+#  geom_spatraster(data = gr) +
+#  scale_fill_gradient(low = "white", high = "blue", na.value = NA) +
+  geom_sf() + 
+  geom_sf(data = refuge, fill = NA) +
+  geom_sf(data = zta, fill = NA, col = "red") +
+  geom_sf(data = acoustic_sites, aes(colour = acoustic_clicks_per_effort)) +
+  scale_colour_gradient(low = "yellow", high = "red", na.value = NA) +
+  coord_sf(crs = st_crs(UTM11N), xlim = c(sight_bbox[c(1, 3)]) + c(-1E4, 1E4), 
+           ylim = c(sight_bbox[c(2, 4)] + c(-0E3, 2E3)))
+```
+
+The pattern is dominated by one site that had a high acoustic encounter rate, so we show the same data in @fig-acoustics2 on the log scale (natural log of the clicks per day + 1).
+
+```{r}
+#| label: fig-acoustics2
+#| fig-cap: "Log of acoustic click detections per day at the PAM sampling locations."
+
+#Create a map showing sighting locations
+ggplot(data = mexico) +  xlab("longitude") + ylab("latitude") +
+#  geom_spatraster(data = gr) +
+#  scale_fill_gradient(low = "white", high = "blue", na.value = NA) +
+  geom_sf() + 
+  geom_sf(data = refuge, fill = NA) +
+  geom_sf(data = zta, fill = NA, col = "red") +
+  geom_sf(data = acoustic_sites, aes(colour = log_acoustic_clicks_per_effort)) +
+  scale_colour_gradient(low = "yellow", high = "red", na.value = NA) +
+  coord_sf(crs = st_crs(UTM11N), xlim = c(sight_bbox[c(1, 3)]) + c(-1E4, 1E4), 
+           ylim = c(sight_bbox[c(2, 4)] + c(-0E3, 2E3)))
+```
+
+## Sampling design
+
+We elected to use a balanced acceptance sampling (BAS) design (Foster et al. 2017; van Dam-Bates et al. 2018).  This class of random design allows specification of the target inclusion probability of each potential sample location while also spreading the sampling over the study area.  Samples are generated in order and any sequential subset is spatially balanced.  Hence if we generate 60 sampling locations and then take the first 30 for deployment 1 and the second 30 for deployment 2 we have 2 spatially balanced samples.  If deployment 2 uses an adaptive design instead then we still had a spatially balanced sample for deployment 1.
+
+For the visual detections we set the inclusion probabilities as proportional to the number of detections per raster cell.  For the acoustic detections, it would not be practical to set the inclusion probability as directly proportional to the acoustic encounter rate as 2 of the 46 locations accounted for almost half of all detections and so the inclusion probabilities would be too unbalanced to generate a valid design realization.  Instead we elected to use the natural log of the (clicks per day + 1) -- this still gave higher inclusion probability to sites with more detections and gave an inclusion probability of 0 for sites with no detections.
+
+One remaining decision is the relative weight to allocate to the visual vs acoustic detection locations.  Here, we elected to allocate equal weight to each.
+
+```{r}
+p_acoustic <- log_acoustic_clicks_per_effort / max(log_acoustic_clicks_per_effort)
+#Set those outisde the potential_acoustic_sample area to 0
+p_acoustic[!potential_acoustic_sample] <- 0
+#It turns out that, like the sightings samples, it is possible to have
+# an acoustic sensor that is outside the ZTA that is within a grid cell
+# centre that is inside the zta.  So, these need to be zeroed.
+tmp <- cell_with_acoustics %in% cells_in_zta
+p_acoustic[tmp] <- 0
+#standardize the acoustic weights so their sum is the same as for the
+# visual surveys - the two survey modes therefore get the same weight
+#Note this means p_acoustic may be more than 1 - doesn't matter 
+# as they get standardized when sampling later
+p_acoustic <- p_acoustic / sum(p_acoustic) * sum(p_sighting) 
+
+#Add together inclusion "probs"
+p <- p_sighting
+p[cell_with_acoustics] <- p[cell_with_acoustics] + p_acoustic
+
+values(gr) <- p
+
+#Sample size
+n <- 70
+#Draw the sample
+#Set seed so it's reproduceable
+set.seed(671497)
+#Need to consider lots of samples as the sample probs are quite
+# unbalanced
+sample <- quasiSamp(n, inclusion.probs = gr, nSampsToConsider = 10000*n)
+```
+
+```{r}
+#Save the sample to a file
+filename3 <- "sample_locations.csv"
+#Get lat long
+tmp <- st_as_sf(sample, coords = c("x", "y"), crs = UTM11N) %>%
+  st_transform(crs = WGS1984) %>%
+  st_coordinates()
+#Add lat long
+sample$longitude <- tmp[, 1]
+sample$latitude <- tmp[, 2]
+write.csv(sample, file = filename3)
+```
+
+A single random realization of the proposed sample scheme, with 70 samples, is shown in @fig-sample, together with information used to inform the inclusion probabilities.  The sample locations alone for the first 35 samples (deployment 1) and second 35 samples (deployment 2) are shown in @fig-sample1.  The locations are also saved in the file `r filename3`.
+
+```{r}
+#| label: fig-sample
+#| fig-cap: "Proposed sample locations (green dots).  Also shown is the logged acoustic detection rates (yellow-orange dots), the sighting locations (crosses) and number of visual detections per raster cell (white to blue)."
+
+ggplot(data = mexico) +  xlab("longitude") + ylab("latitude") +
+  geom_spatraster(data = gr) +
+  scale_fill_gradient(low = "white", high = "blue", na.value = NA) +
+  geom_sf() + 
+  geom_sf(data = refuge, fill = NA) +
+  geom_sf(data = zta, fill = NA, col = "red") +
+  geom_sf(data = acoustic_sites, aes(colour = p_acoustic)) +
+  scale_colour_gradient(low = "yellow", high = "red", na.value = NA) +
+  geom_point(aes(x = x, y = y), data = sample, colour = "green", size = 0.5) +
+  geom_sf(data = sight_dat, shape = "x", size = 1, colour = "black") + 
+  coord_sf(crs = st_crs(UTM11N), xlim = c(sight_bbox[c(1, 3)]) + c(-1E4, 1E4), 
+           ylim = c(sight_bbox[c(2, 4)] + c(-0E3, 2E3)))
+```
+
+```{r}
+#| label: fig-sample1
+#| fig-cap: "Proposed sample locations (green dots) for (A) deployment 1 and (B) deployment 2."
+A <- ggplot(data = mexico) +  xlab("longitude") + ylab("latitude") +
+  geom_sf() + 
+  geom_sf(data = refuge, fill = NA) +
+  geom_sf(data = zta, fill = NA, col = "red") +
+  geom_point(aes(x = x, y = y), data = sample[1:35, ], colour = "green", size = 1) +
+  coord_sf(crs = st_crs(UTM11N), xlim = c(sight_bbox[c(1, 3)]) + c(-1E4, 1E4), 
+           ylim = c(sight_bbox[c(2, 4)] + c(-0E3, 2E3)))
+B <- ggplot(data = mexico) +  xlab("longitude") + ylab("latitude") +
+  geom_sf() + 
+  geom_sf(data = refuge, fill = NA) +
+  geom_sf(data = zta, fill = NA, col = "red") +
+  geom_point(aes(x = x, y = y), data = sample[36:70, ], colour = "green", size = 1) +
+  coord_sf(crs = st_crs(UTM11N), xlim = c(sight_bbox[c(1, 3)]) + c(-1E4, 1E4), 
+           ylim = c(sight_bbox[c(2, 4)] + c(-0E3, 2E3)))
+ggarrange(A, B, labels = c("A", "B"), ncol = 2, nrow = 1)
+```
+
+## Literature cited
+
+- van Dam-Bates, P., O. Gansell and B. Robertson.  2019. Using balanced acceptance sampling as a master sample for
+environmental surveys. Methods in Ecology and Evolution 9: 1718-1726.
+
+- Foster, S.D., G.R. Hosack, E. Lawrence, R. Pzrselawski, et al. 2017. Spatially balanced designs that incorporate legacy sites.  Methods in Ecology and Evolution 8: 1433-1442.
+
+- Jaramillo-Legorreta, A.M., G. Cardenas-Hinojosa, E. Nieto-Garcia, L. Rojas-Bracho, L. Thomas, J. M. Ver Hoef, J. Moore, B. Taylor, J. Barlow and N. Tregenza. 2019. Decline towards extinction of Mexico's vaquita porpoise (Phocoena sinus). Royal Society Open Science. doi: 10.1098/rsos.190598 
