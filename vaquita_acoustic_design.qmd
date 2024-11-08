@@ -1,5 +1,5 @@
 ---
-title: "Vaquita acoustic survey 2024 - proposed survey design v3"
+title: "Vaquita acoustic survey 2024 - proposed survey design v4"
 format: 
   pdf:
     fig-height: 5
@@ -34,7 +34,8 @@ WGS1984 <-"epsg:4326"
 
 - v1 12th July 2024. Initial balanced acceptance sampling design on a 1x1km grid, with 30 locations per deployment.
 - v2 17th July 2024. Switched to a 200m grid on suggestion from Barb Taylor.
-- v3 14th August 2024.  Final version for deployment - went to 35 locations per deployment.
+- v3 14th August 2024.  Version suggested for deployment - went to 35 locations per deployment.
+- v4 22nd August 2024.  Updated to reduce variation in inclusion probabilities, to get around issue of the same location being sampled multiple times. 
 
 ## Introduction
 
@@ -220,7 +221,7 @@ One remaining decision is the relative weight to allocate to the visual vs acous
 
 ```{r}
 p_acoustic <- log_acoustic_clicks_per_effort / max(log_acoustic_clicks_per_effort)
-#Set those outisde the potential_acoustic_sample area to 0
+#Set those outside the potential_acoustic_sample area to 0
 p_acoustic[!potential_acoustic_sample] <- 0
 #It turns out that, like the sightings samples, it is possible to have
 # an acoustic sensor that is outside the ZTA that is within a grid cell
